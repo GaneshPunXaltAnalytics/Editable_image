@@ -63,7 +63,7 @@ async def process_image(file: UploadFile = File(...)):
                 output_path=str(annotated_path),
                 erased_path=str(erased_path),
                 use_word_boxes=True,
-                box_padding=5,
+                box_padding=8,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
