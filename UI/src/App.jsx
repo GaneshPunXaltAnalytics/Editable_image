@@ -8,6 +8,7 @@ const quillModules = {
     ["bold", "italic", "underline"],
     [{ color: [] }, { background: [] }],
     [{ size: ["small", false, "large", "huge"] }],
+    [{ 'font': ['monospace', 'serif'] }],
     [{ list: "ordered" }, { list: "bullet" }],
     [{ align: [] }],
   ],
@@ -18,6 +19,42 @@ function useHtmlForDisplay(html, plainText) {
   if (!html || typeof html !== "string") return false;
   const stripped = (html.replace(/<[^>]+>/g, "").trim() || "").replace(/\s+/g, " ").trim();
   return stripped.length > 0;
+}
+
+// Get the font actually applied in the editor: prefer any element with Quill font class (ql-font-serif, ql-font-monospace, etc.).
+function getEffectiveFontFamily(editorRoot) {
+  if (!editorRoot || typeof window.getComputedStyle !== "function") return "";
+  function findElWithFontClass(el) {
+    if (!el || el.nodeType !== 1) return null;
+    const cls = el.className && typeof el.className === "string" ? el.className : "";
+    if (/\bql-font-(?!sans-serif\b)\w+/.test(cls)) return el;
+    for (let i = 0; i < el.childNodes.length; i++) {
+      const r = findElWithFontClass(el.childNodes[i]);
+      if (r) return r;
+    }
+    return null;
+  }
+  const fontEl = findElWithFontClass(editorRoot);
+  if (fontEl) {
+    const font = (window.getComputedStyle(fontEl).fontFamily || "").trim();
+    if (font) return font;
+  }
+  function firstTextNode(el) {
+    if (!el) return null;
+    if (el.nodeType === 3 && (el.textContent || "").trim().length > 0) return el;
+    for (let i = 0; i < el.childNodes.length; i++) {
+      const r = firstTextNode(el.childNodes[i]);
+      if (r) return r;
+    }
+    return null;
+  }
+  const textNode = firstTextNode(editorRoot);
+  const parentEl = textNode && textNode.parentElement;
+  if (parentEl) {
+    const font = (window.getComputedStyle(parentEl).fontFamily || "").trim();
+    if (font) return font;
+  }
+  return (window.getComputedStyle(editorRoot).fontFamily || "").trim();
 }
 
 // Uncontrolled ReactQuill: defaultValue only, read content on Done. Enables toolbar (color, size, alignment, etc.).
@@ -60,28 +97,29 @@ function CompositeTextEditor({ region, posLeft, posTop, compositeDisplaySize, co
         onClick={() => {
           let text = "";
           let html = "";
+          let fontFamily = "";
           try {
             const editor = typeof quillRef.current?.getEditor === "function" ? quillRef.current.getEditor() : null;
+            const rootEl = editor?.root ?? document.querySelector(".final-composite-editor .ql-editor");
             if (editor) {
               text = (editor.getText().replace(/\n+$/, "") ?? "").trim();
               html = editor.root?.innerHTML ?? "";
-            } else {
-              const el = document.querySelector(".final-composite-editor .ql-editor");
-              if (el) {
-                text = (el.innerText ?? el.textContent ?? "").replace(/\n+$/, "").trim();
-                html = el.innerHTML ?? "";
-              }
+            } else if (rootEl) {
+              text = (rootEl.innerText ?? rootEl.textContent ?? "").replace(/\n+$/, "").trim();
+              html = rootEl.innerHTML ?? "";
             }
+            if (rootEl) fontFamily = getEffectiveFontFamily(rootEl);
           } catch (_) {
             const el = document.querySelector(".final-composite-editor .ql-editor");
             if (el) {
               text = (el.innerText ?? el.textContent ?? "").replace(/\n+$/, "").trim();
               html = el.innerHTML ?? "";
+              fontFamily = getEffectiveFontFamily(el);
             }
           }
           const stripped = (html.replace(/<[^>]+>/g, "").trim() || "").replace(/\s+/g, " ").trim();
           if (stripped.length === 0) html = "";
-          onDone({ text, html });
+          onDone({ text, html, fontFamily });
         }}
       >
         Done editing
@@ -502,56 +540,118 @@ export default function App() {
   }
 
   // Parse HTML into lines of { text, color } for canvas drawing. Uses a temp div + getComputedStyle.
+  // function parseHtmlToColoredLines(html) {
+  //   if (!html || typeof html !== "string") return null;
+  //   const stripped = html.replace(/<[^>]+>/g, "").trim().replace(/\s+/g, " ").trim();
+  //   if (stripped.length === 0) return null;
+  //   const div = document.createElement("div");
+  //   div.innerHTML = html;
+  //   div.style.position = "absolute";
+  //   div.style.left = "-9999px";
+  //   div.style.visibility = "hidden";
+  //   document.body.appendChild(div);
+  //   const defaultColor = "#111827";
+  //   function getColor(el) {
+  //     if (!el || el.nodeType !== 1) return defaultColor;
+  //     const style = window.getComputedStyle(el);
+  //     const c = style.color;
+  //     if (c && c !== "rgba(0, 0, 0, 0)" && c !== "transparent") return c;
+  //     return getColor(el.parentElement);
+  //   }
+  //   const lines = [];
+  //   let currentLine = [];
+  //   function visit(node) {
+  //     if (node.nodeType === 3) {
+  //       const text = node.textContent || "";
+  //       if (text.length > 0) {
+  //         const color = getColor(node.parentElement);
+  //         currentLine.push({ text, color });
+  //       }
+  //       return;
+  //     }
+  //     if (node.nodeType !== 1) return;
+  //     const tag = node.tagName.toLowerCase();
+  //     if (tag === "br" || tag === "p" || tag === "div") {
+  //       if (currentLine.length > 0) {
+  //         lines.push(currentLine);
+  //         currentLine = [];
+  //       }
+  //       if (tag === "br") return;
+  //     }
+  //     for (let i = 0; i < node.childNodes.length; i++) visit(node.childNodes[i]);
+  //     if (tag === "p" || tag === "div") {
+  //       if (currentLine.length > 0) {
+  //         lines.push(currentLine);
+  //         currentLine = [];
+  //       }
+  //     }
+  //   }
+  //   visit(div);
+  //   if (currentLine.length > 0) lines.push(currentLine);
+  //   document.body.removeChild(div);
+  //   return lines.length > 0 ? lines : null;
+  // }
   function parseHtmlToColoredLines(html) {
-    if (!html || typeof html !== "string") return null;
-    const stripped = html.replace(/<[^>]+>/g, "").trim().replace(/\s+/g, " ").trim();
+    if (!html || typeof html !== 'string') return null;
+    const stripped = html.replace(/<[^>]*>/g, '').trim().replace(/\s+/g, ' ').trim();
     if (stripped.length === 0) return null;
-    const div = document.createElement("div");
+
+    const div = document.createElement('div');
     div.innerHTML = html;
-    div.style.position = "absolute";
-    div.style.left = "-9999px";
-    div.style.visibility = "hidden";
+    div.style.position = 'absolute';
+    div.style.left = '-9999px';
+    div.style.visibility = 'hidden';
     document.body.appendChild(div);
-    const defaultColor = "#111827";
-    function getColor(el) {
-      if (!el || el.nodeType !== 1) return defaultColor;
+
+    const defaultColor = '#111827';
+
+    function getStyle(el) {
+      if (!el || el.nodeType !== 1) return { color: defaultColor, fontFamily: 'sans-serif', fontSize: '16px' };
       const style = window.getComputedStyle(el);
       const c = style.color;
-      if (c && c !== "rgba(0, 0, 0, 0)" && c !== "transparent") return c;
-      return getColor(el.parentElement);
+      return {
+        color: (c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent') ? c : defaultColor,
+        fontFamily: style.fontFamily || 'sans-serif',
+        fontSize: style.fontSize || '16px'
+      };
     }
+
     const lines = [];
     let currentLine = [];
+
     function visit(node) {
       if (node.nodeType === 3) {
-        const text = node.textContent || "";
+        const text = node.textContent;
         if (text.length > 0) {
-          const color = getColor(node.parentElement);
-          currentLine.push({ text, color });
+          const style = getStyle(node.parentElement);
+          currentLine.push({ text, color: style.color, fontFamily: style.fontFamily, fontSize: style.fontSize });
         }
         return;
       }
       if (node.nodeType !== 1) return;
+
       const tag = node.tagName.toLowerCase();
-      if (tag === "br" || tag === "p" || tag === "div") {
-        if (currentLine.length > 0) {
-          lines.push(currentLine);
-          currentLine = [];
-        }
-        if (tag === "br") return;
+      if (tag === 'br' || tag === 'p' || tag === 'div') {
+        if (currentLine.length > 0) lines.push(currentLine);
+        currentLine = [];
+        if (tag === 'br') return;
       }
-      for (let i = 0; i < node.childNodes.length; i++) visit(node.childNodes[i]);
-      if (tag === "p" || tag === "div") {
-        if (currentLine.length > 0) {
-          lines.push(currentLine);
-          currentLine = [];
-        }
+
+      for (let i = 0; i < node.childNodes.length; i++) {
+        visit(node.childNodes[i]);
+      }
+
+      if (tag === 'p' || tag === 'div') {
+        if (currentLine.length > 0) lines.push(currentLine);
+        currentLine = [];
       }
     }
+
     visit(div);
     if (currentLine.length > 0) lines.push(currentLine);
     document.body.removeChild(div);
-    return lines.length > 0 ? lines : null;
+
+    return lines.length === 0 ? null : lines;
   }
 
   // Export image with text regions rendered onto it (for download edited). Preserves text color when region.html is set.
@@ -574,21 +674,50 @@ export default function App() {
     if (!regions || regions.length === 0) return canvas.toDataURL("image/png");
     ctx.textBaseline = "top";
     const defaultColor = "#111827";
+
+    // Build canvas font string: quote family only if it contains comma (e.g. "Monaco, Menlo, monospace").
+    function toCanvasFont(sizePx, family) {
+      const f = (family || "sans-serif").trim();
+      // If the family string already contains quotes or is a font stack, don't wrap it in extra quotes.
+      // Most browsers return computed fontFamily with quotes around names with spaces.
+      return `${sizePx}px ${f}`;
+    }
+
     for (const region of regions) {
       const box = region.box;
-      const minX = Math.min(...box.map((p) => p[0]));
-      const minY = Math.min(...box.map((p) => p[1]));
-      const maxY = Math.max(...box.map((p) => p[1]));
-      const fontSize = Math.max(10, (maxY - minY) * 0.75);
-      ctx.font = `${fontSize}px sans-serif`;
+      if (!box) continue;
+      const minX = Math.min(...box.map(p => p[0]));
+      const minY = Math.min(...box.map(p => p[1]));
+      const maxY = Math.max(...box.map(p => p[1]));
+      const fontSize = Math.max(10, (maxY - minY) * 0.72);
       const lineHeight = fontSize * 1.2;
+
+      const regionFontFamily = (region.fontFamily && region.fontFamily.trim()) ? region.fontFamily.trim() : "sans-serif";
+
       const coloredLines = parseHtmlToColoredLines(region.html);
+      ctx.textBaseline = "top";
+
       if (coloredLines && coloredLines.length > 0) {
         let y = minY;
         for (const line of coloredLines) {
           let x = minX;
           for (const seg of line) {
             ctx.fillStyle = seg.color || defaultColor;
+
+            // Logic: 
+            // 1. If the segment has a specific font (e.g. from ql-font- class), use it.
+            // 2. Otherwise if the region has a specific font (applied to the whole region), use it.
+            // 3. Fallback to generic sans-serif.
+            let family = "sans-serif";
+            if (seg.fontFamily && seg.fontFamily.trim() && !seg.fontFamily.includes("sans-serif")) {
+              family = seg.fontFamily.trim();
+            } else if (regionFontFamily && !regionFontFamily.includes("sans-serif")) {
+              family = regionFontFamily;
+            } else if (seg.fontFamily) {
+              family = seg.fontFamily.trim();
+            }
+
+            ctx.font = toCanvasFont(fontSize, family);
             ctx.fillText(seg.text, x, y);
             x += ctx.measureText(seg.text).width;
           }
@@ -596,6 +725,7 @@ export default function App() {
         }
       } else {
         ctx.fillStyle = defaultColor;
+        ctx.font = toCanvasFont(fontSize, regionFontFamily);
         ctx.fillText(region.text || "", minX, minY);
       }
     }
@@ -724,8 +854,8 @@ export default function App() {
         // FastAPI returns JSON with base64 strings:
         // { original, annotated, mask, erased } (each may be null)
         const json = await res.json().catch(() => null);
-        console.log("SERVER RESPONSE: ",json);
-        
+        console.log("SERVER RESPONSE: ", json);
+
         if (json) {
           const result = {
             annotated: json.annotated ? "data:image/png;base64," + json.annotated : null,
@@ -1407,15 +1537,18 @@ export default function App() {
                         type="button"
                         onClick={() => {
                           const editor = typeof fullFinalQuillRef.current?.getEditor === "function" ? fullFinalQuillRef.current.getEditor() : null;
-                          const newText = editor ? (editor.getText().replace(/\n+$/, "") ?? "").trim() : "";
-                          let newHtml = editor ? (editor.root?.innerHTML ?? "") : "";
+                          const rootEl = editor?.root ?? document.querySelector(".final-full-editor .ql-editor");
+                          const newText = editor ? (editor.getText().replace(/\n+$/, "") ?? "").trim() : (rootEl ? (rootEl.innerText ?? rootEl.textContent ?? "").trim() : "");
+                          let newHtml = editor ? (editor.root?.innerHTML ?? "") : (rootEl ? rootEl.innerHTML ?? "" : "");
                           const stripped = (newHtml.replace(/<[^>]+>/g, "").trim() || "").replace(/\s+/g, " ").trim();
                           if (stripped.length === 0) newHtml = "";
                           const htmlToStore = stripped.length > 0 ? newHtml : undefined;
+                          let newFontFamily = rootEl ? getEffectiveFontFamily(rootEl) : "";
                           setTextRegions((prev) => {
                             const r = prev.find((x) => x.id === id);
                             if (!r || (r.text ?? "").trim() === newText) return prev;
                             const payload = { ...r, text: newText, html: htmlToStore };
+                            if (newFontFamily) payload.fontFamily = newFontFamily;
                             if (fullFinalDisplaySize && fullFinalImageSize) {
                               const b = r.box;
                               const maxY = Math.max(...b.map((p) => p[1]));
@@ -1568,12 +1701,13 @@ export default function App() {
                   compositeDisplaySize={compositeDisplaySize}
                   compositeImageSize={compositeImageSize}
                   boxFromMeasuredText={boxFromMeasuredText}
-                  onDone={({ text: newText, html: newHtml }) => {
+                  onDone={({ text: newText, html: newHtml, fontFamily: newFontFamily }) => {
                     const htmlToStore = (newHtml && (newHtml.replace(/<[^>]+>/g, "").trim() || "").replace(/\s+/g, " ").trim().length > 0) ? newHtml : undefined;
                     setCompositeTextRegions((prev) => {
                       const r = prev.find((x) => x.id === id);
                       if (!r) return prev;
                       const payload = { ...r, text: newText, html: htmlToStore };
+                      if (newFontFamily && newFontFamily.trim()) payload.fontFamily = newFontFamily.trim();
                       if (compositeDisplaySize && compositeImageSize) {
                         const b = r.box;
                         const maxY = Math.max(...b.map((p) => p[1]));
