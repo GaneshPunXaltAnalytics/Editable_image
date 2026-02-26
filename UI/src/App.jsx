@@ -7,6 +7,8 @@ export default function App() {
   const [processing, setProcessing] = useState(false);
   const [lastCrop, setLastCrop] = useState(null); // { nx, ny, nWidth, nHeight, dataUrl }
   const [finalImage, setFinalImage] = useState(null);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [fullFinal, setFullFinal] = useState(null); // full-image inpainted from /process_roi
   const [polygonMode, setPolygonMode] = useState(false);
   const [polygonPoints, setPolygonPoints] = useState([]); // array of {dx,dy,nx,ny}
   const [polygons, setPolygons] = useState([]); // saved polygons (multiple)
@@ -34,7 +36,8 @@ export default function App() {
     const newThumbs = files.map(f => ({
       id: cryptoRandomId(),
       url: URL.createObjectURL(f),
-      name: f.name
+      name: f.name,
+      file: f
     }));
     setThumbs(prev => [...prev, ...newThumbs]);
     e.target.value = "";
@@ -404,6 +407,7 @@ export default function App() {
                 className="thumb"
                 onClick={() => {
                   setSelected(t.url);
+                  setSelectedFile(t.file || null);
                   clearSelection();
                 }}
               />
@@ -607,6 +611,57 @@ export default function App() {
             >
               Download Mask
             </button>
+            <button
+              onClick={async () => {
+                // Process full original image using ROI polygons (or last polygon)
+                if (!selectedFile) {
+                  alert("Select the original image (click a thumbnail) before processing.");
+                  return;
+                }
+                // pick ROI: prefer current 4-point polygon, else last saved polygon
+                let sourcePoly = null;
+                if (polygonPoints.length === 4) sourcePoly = polygonPoints;
+                else if (polygons.length > 0) sourcePoly = polygons[polygons.length - 1].points;
+                if (!sourcePoly || sourcePoly.length !== 4) {
+                  alert("Place exactly 4 points to define ROI (or use a saved polygon).");
+                  return;
+                }
+                try {
+                  setProcessing(true);
+                  const polyForServer = sourcePoly.map(p => ({ x: Math.round(p.nx), y: Math.round(p.ny) }));
+                  const form = new FormData();
+                  form.append("file", selectedFile, selectedFile.name || "original.png");
+                  form.append("polygon", JSON.stringify(polyForServer));
+                  form.append("padding", "0");
+                  form.append("min_confidence", "30");
+                  const res = await fetch("http://127.0.0.1:8000/process_roi", {
+                    method: "POST",
+                    body: form
+                  });
+                  if (!res.ok) {
+                    const text = await res.text();
+                    throw new Error(`Server error ${res.status}: ${text}`);
+                  }
+                  const json = await res.json().catch(() => null);
+                  if (!json || !json.final) {
+                    alert("Server returned no final image. Check logs.");
+                    return;
+                  }
+                  setFullFinal("data:image/png;base64," + json.final);
+                  // also update processed mask/annotated previews if present
+                  if (json.mask) setProcessed(prev => ({ ...prev, mask: "data:image/png;base64," + json.mask }));
+                  if (json.annotated) setProcessed(prev => ({ ...prev, annotated: "data:image/png;base64," + json.annotated }));
+                } catch (err) {
+                  console.error("process_roi failed", err);
+                  alert("Full inpaint failed: " + err.message);
+                } finally {
+                  setProcessing(false);
+                }
+              }}
+              disabled={processing}
+            >
+              Process ROI (Full Inpaint)
+            </button>
             {/* saved polygons list with delete */}
             {polygons.length > 0 && (
               <div style={{ marginLeft: 12 }}>
@@ -768,6 +823,54 @@ export default function App() {
             >
               Apply to Original
             </button>
+          </div>
+        </div>
+      </div>
+      <div className="processed-area card" style={{ marginTop: 12 }}>
+        <h3>Full Processing Results</h3>
+        <div style={{ display: "flex", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div>
+            <h4>Annotated</h4>
+            {processed && processed.annotated ? (
+              <>
+                <img src={processed.annotated} alt="annotated" style={{ maxWidth: 420, display: "block" }} />
+                <div style={{ marginTop: 6 }}>
+                  <button onClick={() => downloadDataUrl(processed.annotated, `annotated-${Date.now()}.png`)}>Download Annotated</button>
+                </div>
+              </>
+            ) : (
+              <div className="placeholder">No annotated image</div>
+            )}
+          </div>
+
+          <div>
+            <h4>Mask</h4>
+            {processed && processed.mask ? (
+              <>
+                <img src={processed.mask} alt="mask" style={{ maxWidth: 420, display: "block" }} />
+                <div style={{ marginTop: 6 }}>
+                  <button onClick={() => downloadDataUrl(processed.mask, `mask-${Date.now()}.png`)}>Download Mask</button>
+                </div>
+              </>
+            ) : (
+              <div className="placeholder">No mask image</div>
+            )}
+          </div>
+
+          <div style={{ flexBasis: "100%" }} />
+
+          <div style={{ width: "100%" }}>
+            <h4>Final (Full Image)</h4>
+            {fullFinal ? (
+              <>
+                <img src={fullFinal} alt="final-full" style={{ maxWidth: "100%", display: "block" }} />
+                <div style={{ marginTop: 6 }}>
+                  <button onClick={() => downloadDataUrl(fullFinal, `final-${Date.now()}.png`)}>Download Final</button>
+                </div>
+              </>
+            ) : (
+              <div className="placeholder">No final image yet</div>
+            )}
           </div>
         </div>
       </div>
