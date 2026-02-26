@@ -1,4 +1,94 @@
 import React, { useRef, useState, useEffect } from "react";
+import ReactQuill from "react-quill";
+import "react-quill/dist/quill.snow.css";
+
+const quillModules = {
+  toolbar: [
+    [{ header: [1, 2, 3, false] }],
+    ["bold", "italic", "underline"],
+    [{ color: [] }, { background: [] }],
+    [{ size: ["small", false, "large", "huge"] }],
+    [{ list: "ordered" }, { list: "bullet" }],
+    [{ align: [] }],
+  ],
+};
+
+// Use HTML for overlay only if it contains real text (avoids showing blank when Quill saved empty <p><br></p>).
+function useHtmlForDisplay(html, plainText) {
+  if (!html || typeof html !== "string") return false;
+  const stripped = (html.replace(/<[^>]+>/g, "").trim() || "").replace(/\s+/g, " ").trim();
+  return stripped.length > 0;
+}
+
+// Uncontrolled ReactQuill: defaultValue only, read content on Done. Enables toolbar (color, size, alignment, etc.).
+function CompositeTextEditor({ region, posLeft, posTop, compositeDisplaySize, compositeImageSize, boxFromMeasuredText, onDone, onDragStart }) {
+  const quillRef = useRef(null);
+  const initialContent = region.html ?? region.text ?? "";
+
+  return (
+    <div
+      className="card"
+      style={{
+        position: "absolute",
+        left: posLeft,
+        top: posTop,
+        width: 360,
+        maxWidth: "90%",
+        zIndex: 20,
+        boxShadow: "0 4px 12px rgba(0,0,0,0.25)",
+        marginTop: 0,
+      }}
+    >
+      <h3
+        style={{ marginTop: 0, cursor: "move", userSelect: "none" }}
+        onMouseDown={onDragStart}
+        title="Drag to move"
+      >
+        Edit text — Composite
+      </h3>
+      <div className="final-composite-editor" style={{ marginBottom: 8 }}>
+        <ReactQuill
+          ref={quillRef}
+          theme="snow"
+          defaultValue={initialContent}
+          modules={quillModules}
+          style={{ minHeight: 140 }}
+        />
+      </div>
+      <button
+        type="button"
+        onClick={() => {
+          let text = "";
+          let html = "";
+          try {
+            const editor = typeof quillRef.current?.getEditor === "function" ? quillRef.current.getEditor() : null;
+            if (editor) {
+              text = (editor.getText().replace(/\n+$/, "") ?? "").trim();
+              html = editor.root?.innerHTML ?? "";
+            } else {
+              const el = document.querySelector(".final-composite-editor .ql-editor");
+              if (el) {
+                text = (el.innerText ?? el.textContent ?? "").replace(/\n+$/, "").trim();
+                html = el.innerHTML ?? "";
+              }
+            }
+          } catch (_) {
+            const el = document.querySelector(".final-composite-editor .ql-editor");
+            if (el) {
+              text = (el.innerText ?? el.textContent ?? "").replace(/\n+$/, "").trim();
+              html = el.innerHTML ?? "";
+            }
+          }
+          const stripped = (html.replace(/<[^>]+>/g, "").trim() || "").replace(/\s+/g, " ").trim();
+          if (stripped.length === 0) html = "";
+          onDone({ text, html });
+        }}
+      >
+        Done editing
+      </button>
+    </div>
+  );
+}
 
 export default function App() {
   const [thumbs, setThumbs] = useState([]);
@@ -9,17 +99,34 @@ export default function App() {
   const [finalImage, setFinalImage] = useState(null);
   const [selectedFile, setSelectedFile] = useState(null);
   const [fullFinal, setFullFinal] = useState(null); // full-image inpainted from /process_roi
+  const [fullFinalImageSize, setFullFinalImageSize] = useState(null); // { width, height } natural size
+  const [textRegions, setTextRegions] = useState([]); // [{ id, text, score, box }] box = [[x,y],...] in image coords
+  const [fullFinalDisplaySize, setFullFinalDisplaySize] = useState(null); // { width, height } displayed pixels
+  const [cropTextRegions, setCropTextRegions] = useState([]); // from /process, in crop coords [{ id, text, score, box }]
+  const [cropSize, setCropSize] = useState(null); // { width, height } of crop from /process
+  const [compositeTextRegions, setCompositeTextRegions] = useState([]); // in full image coords, set when Apply to Original
+  const [compositeImageSize, setCompositeImageSize] = useState(null); // full composite dimensions
+  const [compositeDisplaySize, setCompositeDisplaySize] = useState(null); // displayed size of composite img
   const [polygonMode, setPolygonMode] = useState(false);
   const [polygonPoints, setPolygonPoints] = useState([]); // array of {dx,dy,nx,ny}
   const [polygons, setPolygons] = useState([]); // saved polygons (multiple)
   const [maskDataUrl, setMaskDataUrl] = useState(null);
   const [selected, setSelected] = useState(null); // url
+  const [selectedFullFinalTextId, setSelectedFullFinalTextId] = useState(null); // show border only when this region is selected
+  const [selectedCompositeTextId, setSelectedCompositeTextId] = useState(null);
+  const [compositeEditorPosition, setCompositeEditorPosition] = useState(null); // { left, top } when user has dragged the panel
 
   const rightImgRef = useRef(null);
+  const compositeEditorDragRef = useRef(null); // { clientX, clientY, startLeft, startTop } while dragging
   const overlayRef = useRef(null);
   const selectionRef = useRef(null);
   const drawingRef = useRef(false);
   const startRef = useRef({ x: 0, y: 0 });
+  const fullFinalImgRef = useRef(null);
+  const textDragRef = useRef({ regionId: null, startX: 0, startY: 0, startBox: null });
+  const finalCompositeImgRef = useRef(null);
+  const compositeDragRef = useRef({ regionId: null, startX: 0, startY: 0, startBox: null });
+  const fullFinalQuillRef = useRef(null); // ReactQuill for Full Final editor (uncontrolled)
 
   useEffect(() => {
     return () => {
@@ -28,6 +135,115 @@ export default function App() {
       cropped.forEach(c => URL.revokeObjectURL(c));
     };
   }, []); // eslint-disable-line
+
+  // Track displayed size of full final image for text overlay scaling
+  useEffect(() => {
+    if (!fullFinal || !fullFinalImgRef.current) return;
+    const img = fullFinalImgRef.current;
+    const updateSize = () => {
+      if (img && img.getBoundingClientRect) {
+        const rect = img.getBoundingClientRect();
+        setFullFinalDisplaySize({ width: rect.width, height: rect.height });
+      }
+    };
+    updateSize();
+    const ro = new ResizeObserver(updateSize);
+    ro.observe(img);
+    return () => ro.disconnect();
+  }, [fullFinal, textRegions]);
+
+  // Drag text regions: window mousemove/mouseup
+  useEffect(() => {
+    const onMove = (e) => {
+      const drag = textDragRef.current;
+      if (!drag || !drag.regionId || !fullFinalImageSize || !fullFinalDisplaySize) return;
+      const scaleX = fullFinalImageSize.width / fullFinalDisplaySize.width;
+      const scaleY = fullFinalImageSize.height / fullFinalDisplaySize.height;
+      const deltaNatX = (e.clientX - drag.startX) * scaleX;
+      const deltaNatY = (e.clientY - drag.startY) * scaleY;
+      setTextRegions((prev) =>
+        prev.map((r) =>
+          r.id === drag.regionId
+            ? { ...r, box: drag.startBox.map(([x, y]) => [x + deltaNatX, y + deltaNatY]) }
+            : r
+        )
+      );
+    };
+    const onUp = () => {
+      textDragRef.current = { regionId: null, startX: 0, startY: 0, startBox: null };
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [fullFinalImageSize, fullFinalDisplaySize]);
+
+  // Track displayed size of final composite image for text overlay
+  useEffect(() => {
+    if (!finalImage || !finalCompositeImgRef.current) return;
+    const img = finalCompositeImgRef.current;
+    const updateSize = () => {
+      if (img && img.getBoundingClientRect) {
+        const rect = img.getBoundingClientRect();
+        setCompositeDisplaySize({ width: rect.width, height: rect.height });
+      }
+    };
+    updateSize();
+    const ro = new ResizeObserver(updateSize);
+    ro.observe(img);
+    return () => ro.disconnect();
+  }, [finalImage, compositeTextRegions]);
+
+  // Drag the Composite edit panel (mousemove/mouseup)
+  useEffect(() => {
+    const onMove = (e) => {
+      const ref = compositeEditorDragRef.current;
+      if (!ref) return;
+      setCompositeEditorPosition({
+        left: ref.startLeft + (e.clientX - ref.clientX),
+        top: ref.startTop + (e.clientY - ref.clientY),
+      });
+    };
+    const onUp = () => {
+      compositeEditorDragRef.current = null;
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  // Drag composite text regions
+  useEffect(() => {
+    const onMove = (e) => {
+      const drag = compositeDragRef.current;
+      if (!drag || !drag.regionId || !compositeImageSize || !compositeDisplaySize) return;
+      const scaleX = compositeImageSize.width / compositeDisplaySize.width;
+      const scaleY = compositeImageSize.height / compositeDisplaySize.height;
+      const deltaNatX = (e.clientX - drag.startX) * scaleX;
+      const deltaNatY = (e.clientY - drag.startY) * scaleY;
+      setCompositeTextRegions((prev) =>
+        prev.map((r) =>
+          r.id === drag.regionId
+            ? { ...r, box: drag.startBox.map(([x, y]) => [x + deltaNatX, y + deltaNatY]) }
+            : r
+        )
+      );
+    };
+    const onUp = () => {
+      compositeDragRef.current = { regionId: null, startX: 0, startY: 0, startBox: null };
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [compositeImageSize, compositeDisplaySize]);
 
   function handleFiles(e) {
     const files = Array.from(e.target.files || []);
@@ -100,6 +316,23 @@ export default function App() {
       m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
       m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
     ];
+  }
+
+  // Map crop-space point (cx, cy) to full-image coords using lastCrop (rect or polygon)
+  function mapCropPointToFull(cx, cy, lastCrop) {
+    if (!lastCrop) return { x: cx, y: cy };
+    if (lastCrop.polygon) {
+      const { nWidth: nW, nHeight: nH, polygon } = lastCrop;
+      if (nW <= 0 || nH <= 0) return { x: cx, y: cy };
+      const s = cx / nW;
+      const t = cy / nH;
+      const p0 = polygon[0], p1 = polygon[1], p2 = polygon[2], p3 = polygon[3];
+      return {
+        x: (1 - s) * (1 - t) * p0.x + s * (1 - t) * p1.x + (1 - s) * t * p3.x + s * t * p2.x,
+        y: (1 - s) * (1 - t) * p0.y + s * (1 - t) * p1.y + (1 - s) * t * p3.y + s * t * p2.y,
+      };
+    }
+    return { x: cx + lastCrop.nx, y: cy + lastCrop.ny };
   }
 
   function computeAffine(srcTri, dstTri) {
@@ -242,6 +475,133 @@ export default function App() {
     a.remove();
   }
 
+  // Measure text in display pixels (same font as overlay) for dynamic box resize
+  function measureTextDisplay(text, fontSizePx) {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    ctx.font = `${fontSizePx}px sans-serif`;
+    const width = ctx.measureText(text || "").width;
+    const height = fontSizePx * 1.2;
+    return { width, height };
+  }
+
+  // Compute new box (image coords): keep width and top-left fixed; expand height only (never shrink)
+  function boxFromMeasuredText(region, newText, displaySize, imageSize, fontSizeDisplay) {
+    const box = region.box;
+    const minX = Math.min(...box.map((p) => p[0]));
+    const maxX = Math.max(...box.map((p) => p[0]));
+    const minY = Math.min(...box.map((p) => p[1]));
+    const maxY = Math.max(...box.map((p) => p[1]));
+    const currentHImg = maxY - minY; // current height in image coords
+    const measured = measureTextDisplay(newText, fontSizeDisplay);
+    const paddingY = 4;
+    const hDisp = measured.height + paddingY;
+    const hImgNeeded = hDisp * (imageSize.height / displaySize.height);
+    const hImg = Math.max(currentHImg, hImgNeeded); // only expand, never shrink
+    return [[minX, minY], [maxX, minY], [maxX, minY + hImg], [minX, minY + hImg]];
+  }
+
+  // Parse HTML into lines of { text, color } for canvas drawing. Uses a temp div + getComputedStyle.
+  function parseHtmlToColoredLines(html) {
+    if (!html || typeof html !== "string") return null;
+    const stripped = html.replace(/<[^>]+>/g, "").trim().replace(/\s+/g, " ").trim();
+    if (stripped.length === 0) return null;
+    const div = document.createElement("div");
+    div.innerHTML = html;
+    div.style.position = "absolute";
+    div.style.left = "-9999px";
+    div.style.visibility = "hidden";
+    document.body.appendChild(div);
+    const defaultColor = "#111827";
+    function getColor(el) {
+      if (!el || el.nodeType !== 1) return defaultColor;
+      const style = window.getComputedStyle(el);
+      const c = style.color;
+      if (c && c !== "rgba(0, 0, 0, 0)" && c !== "transparent") return c;
+      return getColor(el.parentElement);
+    }
+    const lines = [];
+    let currentLine = [];
+    function visit(node) {
+      if (node.nodeType === 3) {
+        const text = node.textContent || "";
+        if (text.length > 0) {
+          const color = getColor(node.parentElement);
+          currentLine.push({ text, color });
+        }
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const tag = node.tagName.toLowerCase();
+      if (tag === "br" || tag === "p" || tag === "div") {
+        if (currentLine.length > 0) {
+          lines.push(currentLine);
+          currentLine = [];
+        }
+        if (tag === "br") return;
+      }
+      for (let i = 0; i < node.childNodes.length; i++) visit(node.childNodes[i]);
+      if (tag === "p" || tag === "div") {
+        if (currentLine.length > 0) {
+          lines.push(currentLine);
+          currentLine = [];
+        }
+      }
+    }
+    visit(div);
+    if (currentLine.length > 0) lines.push(currentLine);
+    document.body.removeChild(div);
+    return lines.length > 0 ? lines : null;
+  }
+
+  // Export image with text regions rendered onto it (for download edited). Preserves text color when region.html is set.
+  async function exportImageWithText(imageDataUrl, imageSize, regions) {
+    if (!imageDataUrl) return imageDataUrl;
+    const img = await new Promise((res, rej) => {
+      const i = new Image();
+      i.crossOrigin = "anonymous";
+      i.onload = () => res(i);
+      i.onerror = rej;
+      i.src = imageDataUrl;
+    });
+    const w = (imageSize && imageSize.width) ? imageSize.width : img.naturalWidth;
+    const h = (imageSize && imageSize.height) ? imageSize.height : img.naturalHeight;
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0, w, h);
+    if (!regions || regions.length === 0) return canvas.toDataURL("image/png");
+    ctx.textBaseline = "top";
+    const defaultColor = "#111827";
+    for (const region of regions) {
+      const box = region.box;
+      const minX = Math.min(...box.map((p) => p[0]));
+      const minY = Math.min(...box.map((p) => p[1]));
+      const maxY = Math.max(...box.map((p) => p[1]));
+      const fontSize = Math.max(10, (maxY - minY) * 0.75);
+      ctx.font = `${fontSize}px sans-serif`;
+      const lineHeight = fontSize * 1.2;
+      const coloredLines = parseHtmlToColoredLines(region.html);
+      if (coloredLines && coloredLines.length > 0) {
+        let y = minY;
+        for (const line of coloredLines) {
+          let x = minX;
+          for (const seg of line) {
+            ctx.fillStyle = seg.color || defaultColor;
+            ctx.fillText(seg.text, x, y);
+            x += ctx.measureText(seg.text).width;
+          }
+          y += lineHeight;
+        }
+      } else {
+        ctx.fillStyle = defaultColor;
+        ctx.fillText(region.text || "", minX, minY);
+      }
+    }
+    return canvas.toDataURL("image/png");
+  }
+
   function onMouseDown(e) {
     // if polygon mode active, don't start rectangular selection
     if (polygonMode) return;
@@ -378,6 +738,16 @@ export default function App() {
           } else {
             console.warn("No image fields found in /process response", json);
             alert("Server returned no processed images. Check server logs.");
+          }
+          const regions = (json.text_regions || []).map((r) => ({
+            id: cryptoRandomId(),
+            text: r.text != null ? String(r.text) : "",
+            score: r.score != null ? Number(r.score) : 1,
+            box: Array.isArray(r.box) ? r.box.map((p) => [Number(p[0]), Number(p[1])]) : [[0, 0], [0, 0], [0, 0], [0, 0]],
+          }));
+          setCropTextRegions(regions);
+          if (json.crop_width != null && json.crop_height != null) {
+            setCropSize({ width: json.crop_width, height: json.crop_height });
           }
         } else {
           console.warn("Empty or invalid JSON from /process");
@@ -575,6 +945,16 @@ export default function App() {
                     };
                     setProcessed(result);
                     setPolygonMode(false);
+                    const regions = (json.text_regions || []).map((r) => ({
+                      id: cryptoRandomId(),
+                      text: r.text != null ? String(r.text) : "",
+                      score: r.score != null ? Number(r.score) : 1,
+                      box: Array.isArray(r.box) ? r.box.map((p) => [Number(p[0]), Number(p[1])]) : [[0, 0], [0, 0], [0, 0], [0, 0]],
+                    }));
+                    setCropTextRegions(regions);
+                    if (json.crop_width != null && json.crop_height != null) {
+                      setCropSize({ width: json.crop_width, height: json.crop_height });
+                    }
                   } else {
                     alert("Invalid response from server.");
                   }
@@ -648,6 +1028,16 @@ export default function App() {
                     return;
                   }
                   setFullFinal("data:image/png;base64," + json.final);
+                  if (json.image_width != null && json.image_height != null) {
+                    setFullFinalImageSize({ width: json.image_width, height: json.image_height });
+                  }
+                  const regions = (json.text_regions || []).map((r, i) => ({
+                    id: cryptoRandomId(),
+                    text: r.text || "",
+                    score: r.score != null ? r.score : 1,
+                    box: Array.isArray(r.box) ? r.box.map(p => [Number(p[0]), Number(p[1])]) : [[0, 0], [0, 0], [0, 0], [0, 0]],
+                  }));
+                  setTextRegions(regions);
                   // also update processed mask/annotated previews if present
                   if (json.mask) setProcessed(prev => ({ ...prev, mask: "data:image/png;base64," + json.mask }));
                   if (json.annotated) setProcessed(prev => ({ ...prev, annotated: "data:image/png;base64," + json.annotated }));
@@ -793,6 +1183,15 @@ export default function App() {
 
                     const finalDataUrl = mainCanvas.toDataURL("image/png");
                     setFinalImage(finalDataUrl);
+                    setCompositeImageSize({ width: origW, height: origH });
+                    const mappedPoly = cropTextRegions.map((r) => ({
+                      ...r,
+                      box: r.box.map(([cx, cy]) => {
+                        const p = mapCropPointToFull(cx, cy, lastCrop);
+                        return [p.x, p.y];
+                      }),
+                    }));
+                    setCompositeTextRegions(mappedPoly);
                   } else {
                     // axis-aligned paste (existing flow)
                     const { nx, ny, nWidth, nHeight } = lastCrop;
@@ -813,6 +1212,15 @@ export default function App() {
                     mctx.drawImage(tmp, nx, ny);
                     const finalDataUrl = mainCanvas.toDataURL("image/png");
                     setFinalImage(finalDataUrl);
+                    setCompositeImageSize({ width: origW, height: origH });
+                    const mapped = cropTextRegions.map((r) => ({
+                      ...r,
+                      box: r.box.map(([cx, cy]) => {
+                        const p = mapCropPointToFull(cx, cy, lastCrop);
+                        return [p.x, p.y];
+                      }),
+                    }));
+                    setCompositeTextRegions(mapped);
                   }
                 } catch (err) {
                   console.error("Composite failed", err);
@@ -860,13 +1268,173 @@ export default function App() {
           <div style={{ flexBasis: "100%" }} />
 
           <div style={{ width: "100%" }}>
-            <h4>Final (Full Image)</h4>
+            <h4>Final (Full Image) — detected text (drag to move, click to edit)</h4>
             {fullFinal ? (
               <>
-                <img src={fullFinal} alt="final-full" style={{ maxWidth: "100%", display: "block" }} />
-                <div style={{ marginTop: 6 }}>
-                  <button onClick={() => downloadDataUrl(fullFinal, `final-${Date.now()}.png`)}>Download Final</button>
+                <div className="final-image-wrapper" style={{ position: "relative", display: "inline-block", maxWidth: "100%" }}>
+                  <img
+                    ref={fullFinalImgRef}
+                    src={fullFinal}
+                    alt="final-full"
+                    style={{ maxWidth: "100%", display: "block", verticalAlign: "top" }}
+                    onLoad={() => {
+                      const img = fullFinalImgRef.current;
+                      if (!img) return;
+                      if (!fullFinalImageSize) {
+                        setFullFinalImageSize({
+                          width: img.naturalWidth,
+                          height: img.naturalHeight,
+                        });
+                      }
+                      const rect = img.getBoundingClientRect();
+                      setFullFinalDisplaySize({ width: rect.width, height: rect.height });
+                    }}
+                  />
+                  {textRegions.length > 0 && fullFinalImageSize && fullFinalDisplaySize && (
+                    <div
+                      className="final-text-overlay"
+                      style={{
+                        position: "absolute",
+                        left: 0,
+                        top: 0,
+                        width: fullFinalDisplaySize.width,
+                        height: fullFinalDisplaySize.height,
+                        pointerEvents: "auto",
+                      }}
+                      onClick={() => setSelectedFullFinalTextId(null)}
+                    >
+                      {textRegions.map((region) => {
+                        const box = region.box;
+                        const minX = Math.min(...box.map((p) => p[0]));
+                        const minY = Math.min(...box.map((p) => p[1]));
+                        const maxX = Math.max(...box.map((p) => p[0]));
+                        const maxY = Math.max(...box.map((p) => p[1]));
+                        const scaleX = fullFinalDisplaySize.width / fullFinalImageSize.width;
+                        const scaleY = fullFinalDisplaySize.height / fullFinalImageSize.height;
+                        const left = minX * scaleX;
+                        const top = minY * scaleY;
+                        const width = Math.max(20, (maxX - minX) * scaleX);
+                        const height = Math.max(14, (maxY - minY) * scaleY);
+                        const isSelected = selectedFullFinalTextId === region.id;
+                        return (
+                          <div
+                            key={region.id}
+                            className="text-region-box"
+                            style={{
+                              position: "absolute",
+                              left,
+                              top,
+                              width,
+                              height,
+                              pointerEvents: "auto",
+                              cursor: "move",
+                              border: isSelected ? "1px solid rgba(37,99,235,0.7)" : "1px solid transparent",
+                              background: "transparent",
+                              padding: "1px 4px",
+                              fontSize: Math.max(10, height * 0.7),
+                              lineHeight: 1.1,
+                              overflow: "hidden",
+                              boxSizing: "border-box",
+                            }}
+                            onClick={(e) => e.stopPropagation()}
+                            onMouseDown={(e) => {
+                              setSelectedFullFinalTextId(region.id);
+                              if (e.target.closest(".text-region-content")) return;
+                              e.preventDefault();
+                              textDragRef.current = {
+                                regionId: region.id,
+                                startX: e.clientX,
+                                startY: e.clientY,
+                                startBox: region.box.map((p) => [...p]),
+                              };
+                            }}
+                          >
+                            <div
+                              className="text-region-content"
+                              onClick={(e) => { e.stopPropagation(); setSelectedFullFinalTextId(region.id); }}
+                              onMouseDown={(e) => e.stopPropagation()}
+                              style={{
+                                width: "100%",
+                                height: "100%",
+                                overflow: "hidden",
+                                fontSize: "inherit",
+                                lineHeight: 1.2,
+                                cursor: "text",
+                              }}
+                              title="Click to edit in toolbar below"
+                            >
+                              {useHtmlForDisplay(region.html, region.text) ? (
+                                <div className="text-region-html" dangerouslySetInnerHTML={{ __html: region.html }} />
+                              ) : (
+                                (region.text || " ")
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
+                <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <button onClick={() => downloadDataUrl(fullFinal, `final-${Date.now()}.png`)}>Download Final</button>
+                  <button
+                    onClick={async () => {
+                      const dataUrl = await exportImageWithText(fullFinal, fullFinalImageSize || undefined, textRegions);
+                      downloadDataUrl(dataUrl, `final-edited-${Date.now()}.png`);
+                    }}
+                  >
+                    Download edited
+                  </button>
+                </div>
+                {selectedFullFinalTextId && (() => {
+                  const id = selectedFullFinalTextId;
+                  const region = textRegions.find((r) => r.id === id);
+                  if (!region) return null;
+                  const initialContent = region.html ?? region.text ?? "";
+                  return (
+                    <div className="card" style={{ marginTop: 12 }}>
+                      <h3>Edit text — Full image</h3>
+                      <div className="final-full-editor" style={{ marginBottom: 8 }} key={id}>
+                        <ReactQuill
+                          ref={fullFinalQuillRef}
+                          theme="snow"
+                          defaultValue={initialContent}
+                          modules={quillModules}
+                          style={{ minHeight: 140 }}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const editor = typeof fullFinalQuillRef.current?.getEditor === "function" ? fullFinalQuillRef.current.getEditor() : null;
+                          const newText = editor ? (editor.getText().replace(/\n+$/, "") ?? "").trim() : "";
+                          let newHtml = editor ? (editor.root?.innerHTML ?? "") : "";
+                          const stripped = (newHtml.replace(/<[^>]+>/g, "").trim() || "").replace(/\s+/g, " ").trim();
+                          if (stripped.length === 0) newHtml = "";
+                          const htmlToStore = stripped.length > 0 ? newHtml : undefined;
+                          setTextRegions((prev) => {
+                            const r = prev.find((x) => x.id === id);
+                            if (!r || (r.text ?? "").trim() === newText) return prev;
+                            const payload = { ...r, text: newText, html: htmlToStore };
+                            if (fullFinalDisplaySize && fullFinalImageSize) {
+                              const b = r.box;
+                              const maxY = Math.max(...b.map((p) => p[1]));
+                              const minY = Math.min(...b.map((p) => p[1]));
+                              const scaleY = fullFinalDisplaySize.height / fullFinalImageSize.height;
+                              const displayH = (maxY - minY) * scaleY;
+                              const fontSizeDisplay = Math.max(10, displayH * 0.7);
+                              payload.box = boxFromMeasuredText(r, newText, fullFinalDisplaySize, fullFinalImageSize, fontSizeDisplay);
+                            }
+                            return prev.map((x) => (x.id === id ? payload : x));
+                          });
+                          setTimeout(() => setSelectedFullFinalTextId(null), 0);
+                        }}
+                      >
+                        Done editing
+                      </button>
+                    </div>
+                  );
+                })()}
               </>
             ) : (
               <div className="placeholder">No final image yet</div>
@@ -876,11 +1444,179 @@ export default function App() {
       </div>
       {finalImage && (
         <div className="cropped-area card" style={{ marginTop: 12 }}>
-          <h3>Final Composite</h3>
-          <img src={finalImage} alt="final-composite" />
+          <h3>Final Composite — detected text (drag to move, click to edit)</h3>
+          <div className="final-image-wrapper" style={{ position: "relative", display: "inline-block", maxWidth: "100%" }}>
+            <img
+              ref={finalCompositeImgRef}
+              src={finalImage}
+              alt="final-composite"
+              style={{ maxWidth: "100%", display: "block", verticalAlign: "top" }}
+              onLoad={() => {
+                const img = finalCompositeImgRef.current;
+                if (!img) return;
+                const rect = img.getBoundingClientRect();
+                setCompositeDisplaySize({ width: rect.width, height: rect.height });
+              }}
+            />
+            {compositeTextRegions.length > 0 && compositeImageSize && compositeDisplaySize && (
+              <div
+                className="final-text-overlay"
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  top: 0,
+                  width: compositeDisplaySize.width,
+                  height: compositeDisplaySize.height,
+                  pointerEvents: "auto",
+                }}
+                onClick={() => setSelectedCompositeTextId(null)}
+              >
+                {compositeTextRegions.map((region) => {
+                  const box = region.box;
+                  const minX = Math.min(...box.map((p) => p[0]));
+                  const minY = Math.min(...box.map((p) => p[1]));
+                  const maxX = Math.max(...box.map((p) => p[0]));
+                  const maxY = Math.max(...box.map((p) => p[1]));
+                  const scaleX = compositeDisplaySize.width / compositeImageSize.width;
+                  const scaleY = compositeDisplaySize.height / compositeImageSize.height;
+                  const left = minX * scaleX;
+                  const top = minY * scaleY;
+                  const width = Math.max(20, (maxX - minX) * scaleX);
+                  const height = Math.max(14, (maxY - minY) * scaleY);
+                  const isSelected = selectedCompositeTextId === region.id;
+                  return (
+                    <div
+                      key={region.id}
+                      className="text-region-box"
+                      style={{
+                        position: "absolute",
+                        left,
+                        top,
+                        width,
+                        height,
+                        pointerEvents: "auto",
+                        cursor: "move",
+                        border: isSelected ? "1px solid rgba(37,99,235,0.7)" : "1px solid transparent",
+                        background: "transparent",
+                        padding: "1px 4px",
+                        fontSize: Math.max(10, height * 0.7),
+                        lineHeight: 1.1,
+                        overflow: "hidden",
+                        boxSizing: "border-box",
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                      onMouseDown={(e) => {
+                        setSelectedCompositeTextId(region.id);
+                        if (e.target.closest(".text-region-content")) return;
+                        e.preventDefault();
+                        compositeDragRef.current = {
+                          regionId: region.id,
+                          startX: e.clientX,
+                          startY: e.clientY,
+                          startBox: region.box.map((p) => [...p]),
+                        };
+                      }}
+                    >
+                      <div
+                        className="text-region-content"
+                        onClick={(e) => { e.stopPropagation(); setSelectedCompositeTextId(region.id); }}
+                        onMouseDown={(e) => e.stopPropagation()}
+                        style={{
+                          width: "100%",
+                          height: "100%",
+                          overflow: "hidden",
+                          fontSize: "inherit",
+                          lineHeight: 1.2,
+                          cursor: "text",
+                        }}
+                        title="Click to edit in toolbar below"
+                      >
+                        {useHtmlForDisplay(region.html, region.text) ? (
+                          <div className="text-region-html" dangerouslySetInnerHTML={{ __html: region.html }} />
+                        ) : (
+                          (region.text || " ")
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {selectedCompositeTextId && compositeDisplaySize && compositeImageSize && (() => {
+              const id = selectedCompositeTextId;
+              const region = compositeTextRegions.find((r) => r.id === id);
+              if (!region) return null;
+              const box = region.box;
+              const minX = Math.min(...box.map((p) => p[0]));
+              const minY = Math.min(...box.map((p) => p[1]));
+              const scaleX = compositeDisplaySize.width / compositeImageSize.width;
+              const scaleY = compositeDisplaySize.height / compositeImageSize.height;
+              const regionLeft = minX * scaleX;
+              const regionTop = minY * scaleY;
+              const EDITOR_HEIGHT = 220;
+              const GAP = 8;
+              const SHIFT_UP = 50;
+              const defaultTop = Math.max(8, regionTop - EDITOR_HEIGHT - GAP - SHIFT_UP);
+              const posLeft = compositeEditorPosition?.left ?? regionLeft;
+              const posTop = compositeEditorPosition?.top ?? defaultTop;
+              return (
+                <CompositeTextEditor
+                  key={id}
+                  region={region}
+                  posLeft={posLeft}
+                  posTop={posTop}
+                  compositeDisplaySize={compositeDisplaySize}
+                  compositeImageSize={compositeImageSize}
+                  boxFromMeasuredText={boxFromMeasuredText}
+                  onDone={({ text: newText, html: newHtml }) => {
+                    const htmlToStore = (newHtml && (newHtml.replace(/<[^>]+>/g, "").trim() || "").replace(/\s+/g, " ").trim().length > 0) ? newHtml : undefined;
+                    setCompositeTextRegions((prev) => {
+                      const r = prev.find((x) => x.id === id);
+                      if (!r) return prev;
+                      const payload = { ...r, text: newText, html: htmlToStore };
+                      if (compositeDisplaySize && compositeImageSize) {
+                        const b = r.box;
+                        const maxY = Math.max(...b.map((p) => p[1]));
+                        const minY = Math.min(...b.map((p) => p[1]));
+                        const scaleY = compositeDisplaySize.height / compositeImageSize.height;
+                        const displayH = (maxY - minY) * scaleY;
+                        const fontSizeDisplay = Math.max(10, displayH * 0.7);
+                        payload.box = boxFromMeasuredText(r, newText, compositeDisplaySize, compositeImageSize, fontSizeDisplay);
+                      }
+                      return prev.map((x) => (x.id === id ? payload : x));
+                    });
+                    setTimeout(() => {
+                      setSelectedCompositeTextId(null);
+                      setCompositeEditorPosition(null);
+                    }, 0);
+                  }}
+                  onDragStart={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    compositeEditorDragRef.current = {
+                      clientX: e.clientX,
+                      clientY: e.clientY,
+                      startLeft: posLeft,
+                      startTop: posTop,
+                    };
+                  }}
+                />
+              );
+            })()}
+          </div>
+          <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button onClick={() => downloadDataUrl(finalImage, `composite-${Date.now()}.png`)}>Download image</button>
+            <button
+              onClick={async () => {
+                const dataUrl = await exportImageWithText(finalImage, compositeImageSize || undefined, compositeTextRegions);
+                downloadDataUrl(dataUrl, `composite-edited-${Date.now()}.png`);
+              }}
+            >
+              Download edited
+            </button>
+          </div>
         </div>
       )}
     </div>
   );
 }
-

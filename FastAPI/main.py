@@ -69,7 +69,7 @@ async def process_image(file: UploadFile = File(...)):
 
         try:
             # Call the existing function which writes annotated + erased + mask files
-            tr.extract_text_and_color(
+            extract_result = tr.extract_text_and_color(
                 str(input_path),
                 output_path=str(annotated_path),
                 erased_path=str(erased_path),
@@ -78,6 +78,7 @@ async def process_image(file: UploadFile = File(...)):
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+        text_regions = extract_result.get("text_regions", []) if isinstance(extract_result, dict) else []
 
         # Mask path is derived by text_removal.py (erased_path -> *_mask.png)
         mask_path = Path(str(erased_path)).with_name(Path(str(erased_path)).name.replace(".png", "_mask.png"))
@@ -126,12 +127,17 @@ async def process_image(file: UploadFile = File(...)):
             erased_b64 = _b64(erased_path) if erased_path.exists() else None
             mask_b64 = _b64(mask_path) if mask_path.exists() else None
 
-        return JSONResponse({
+        out = {
             "original": original_b64,
             "annotated": annotated_b64,
             "mask": mask_b64,
-            "erased": erased_b64
-        })
+            "erased": erased_b64,
+            "text_regions": text_regions,
+        }
+        if target_size:
+            out["crop_width"] = target_size[0]
+            out["crop_height"] = target_size[1]
+        return JSONResponse(out)
 
 
 def _order_quad(pts: List[Tuple[float, float]]):
@@ -340,6 +346,18 @@ async def process_with_roi(
         annotated_b64 = _np_to_b64_png(vis_annot_rgb)
     except Exception:
         annotated_b64 = None
+
+    # Build text_regions: each box in full-image coordinates for UI overlay
+    text_regions = []
+    for box, text, score in valid_boxes:
+        box_arr = np.array(box, dtype=np.float32).reshape(1, -1, 2)
+        box_full = cv2.perspectiveTransform(box_arr, Minv).reshape(-1, 2)
+        text_regions.append({
+            "text": text,
+            "score": round(float(score), 4),
+            "box": [[float(x), float(y)] for x, y in box_full.tolist()],
+        })
+
     # Save outputs to disk for later inspection
     try:
         base = Path(__file__).resolve().parents[1]
@@ -377,6 +395,9 @@ async def process_with_roi(
         "final": final_b64,
         "mask": mask_b64,
         "annotated": annotated_b64,
+        "image_width": w_orig,
+        "image_height": h_orig,
+        "text_regions": text_regions,
         "paths": {
             "final": str(final_path) if 'final_path' in locals() else None,
             "mask": str(mask_path) if 'mask_path' in locals() else None,

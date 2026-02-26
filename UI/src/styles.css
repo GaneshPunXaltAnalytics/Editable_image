@@ -42,4 +42,13 @@ button[disabled]{opacity:0.6;cursor:default}
 .cropped-area{margin-top:18px;padding:12px;border-radius:8px}
 #croppedContainer img{max-width:320px;margin:6px;border-radius:6px;border:1px solid #e5e7eb}
 .placeholder{color:var(--muted);padding:18px}
+/* Final image text overlay */
+.final-image-wrapper{line-height:0}
+.text-region-box input{font-family:inherit;color:#111827}
+/* Prevent Quill-injected HTML from hiding text: reset <p> margins so content isn't clipped by overflow */
+.text-region-content p,.text-region-html p{margin:0 0 2px 0;line-height:inherit;display:block}
+.text-region-content .ql-editor p{margin:0 0 2px 0}
+.text-region-html{display:block;min-height:1em}
+/* Ensure overlay text is visible (fallback when content has no inline color) */
+.text-region-content{color:#1f2937}
 
